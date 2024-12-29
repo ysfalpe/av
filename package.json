@@ -1,0 +1,15 @@
+{
+  "name": "video-subtitler",
+  "version": "1.0.0",
+  "description": "Video altyazı oluşturucu",
+  "scripts": {
+    "start": "cd backend && python start_services.py",
+    "dev": "cd frontend && npm run dev",
+    "build": "cd frontend && npm run build",
+    "install": "cd frontend && npm install && cd ../backend && pip install -r requirements.txt"
+  },
+  "engines": {
+    "node": ">=16.0.0",
+    "npm": ">=8.0.0"
+  }
+} 
