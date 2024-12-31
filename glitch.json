@@ -1,17 +1,25 @@
 {
-  "install": "npm install",
-  "start": "npm start",
+  "install": "bash -c 'apt-get update && apt-get install -y ffmpeg redis-server python3-dev build-essential && pip install --no-cache-dir -r backend/requirements.txt'",
+  "start": "bash start.sh",
   "watch": {
+    "ignore": [
+      "\\.pyc$",
+      "__pycache__",
+      "node_modules",
+      "model",
+      "\\.git",
+      "logs/.*",
+      "/tmp/.*"
+    ],
     "install": {
       "include": [
-        "^package\\.json$",
-        "^\\.env$"
+        "^requirements\\.txt$"
       ]
     },
     "restart": {
       "include": [
-        "^backend/",
-        "^frontend/"
+        "\\.py$",
+        "^start\\.sh"
       ]
     },
     "throttle": 1000

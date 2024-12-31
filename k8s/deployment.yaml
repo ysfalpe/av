@@ -1,0 +1,117 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: video-subtitler
+  labels:
+    app: video-subtitler
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: video-subtitler
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: video-subtitler
+    spec:
+      containers:
+      - name: video-subtitler
+        image: video-subtitler:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+        env:
+        - name: ENVIRONMENT
+          value: "production"
+        - name: REDIS_HOST
+          value: "redis-service"
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: database-url
+        - name: SENTRY_DSN
+          valueFrom:
+            secretKeyRef:
+              name: app-secrets
+              key: sentry-dsn
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health/liveness
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health/readiness
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        volumeMounts:
+        - name: storage
+          mountPath: /app/storage
+      volumes:
+      - name: storage
+        persistentVolumeClaim:
+          claimName: video-storage-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: video-subtitler-service
+spec:
+  selector:
+    app: video-subtitler
+  ports:
+  - port: 80
+    targetPort: 8000
+  type: LoadBalancer
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: video-subtitler-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: video-subtitler
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: video-storage-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: standard 

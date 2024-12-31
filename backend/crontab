@@ -1,0 +1,8 @@
+# Her saat başı geçici dosyaları temizle
+0 * * * * cd /app/backend && python cleanup.py >> /app/logs/cleanup.log 2>&1
+
+# Her gün gece yarısı Redis önbelleğini temizle
+0 0 * * * cd /app/backend && python cleanup.py --redis-only >> /app/logs/cleanup.log 2>&1
+
+# Her 4 dakikada bir health check yap
+*/4 * * * * curl -s https://${PROJECT_DOMAIN}.glitch.me/health >> /app/logs/health.log 2>&1 

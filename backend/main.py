@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, BackgroundTasks, Query, Depends, Cookie, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 import os
@@ -15,15 +15,34 @@ from slowapi.errors import RateLimitExceeded
 import magic
 import time
 import hashlib
-import aioredis
+import redis.asyncio as aioredis
 from tasks import process_video
-from subtitle_utils import create_srt, create_vtt, adjust_timing, merge_nearby_subtitles
+from subtitle_utils import create_srt, create_vtt, adjust_timing, merge_nearby_subtitles, create_subtitled_video
 from audio_utils import normalize_audio, get_audio_stats
 from logger import app_logger, request_logger
 from exceptions import (
     ValidationError, FileProcessingError, AudioProcessingError,
     SubtitleError, RateLimitError, NetworkError, format_error_response
 )
+from fastapi.security import APIKeyCookie, HTTPBearer
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+import secrets
+from logger_config import setup_logging
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from .auth import (
+    Token, User, fake_users_db, authenticate_user, create_access_token,
+    get_current_active_user, generate_csrf_token
+)
+from .services.video_validator import VideoValidator
+from .schemas import VideoUploadRequest, VideoValidationResult
+from .middleware.security import SecurityMiddleware, XSSProtection, RateLimitByIP
+from .middleware.request_logging import RequestLoggingMiddleware
+from .error_handlers import api_exception_handler, unhandled_exception_handler
+from .exceptions import BaseAPIException
 
 # Redis bağlantısı
 redis = None
@@ -31,30 +50,69 @@ redis = None
 async def get_redis():
     global redis
     if redis is None:
-        redis = await aioredis.from_url('redis://localhost:6379', encoding='utf-8', decode_responses=True)
+        try:
+            redis = await aioredis.from_url(
+                os.getenv("REDIS_URL"),
+                encoding="utf-8",
+                decode_responses=True,
+                socket_timeout=5.0,
+                socket_connect_timeout=5.0,
+                retry_on_timeout=True,
+                max_connections=10
+            )
+        except Exception as e:
+            app_logger.error(f"Redis bağlantı hatası: {str(e)}")
+            raise NetworkError("Redis servisine bağlanılamadı")
     return redis
 
 # Rate limiter oluştur
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI()
+app = FastAPI(
+    title=settings.PROJECT_NAME,
+    version=settings.VERSION,
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# CORS ayarları
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://localhost:5173",
-    "https://your-production-domain.com"
-]
-
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
+    allow_origins=json.loads(settings.BACKEND_CORS_ORIGINS),
     allow_credentials=True,
-    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
-    max_age=3600
+    expose_headers=["Content-Disposition"],
 )
+
+# Güvenlik middleware'leri
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(
+    SecurityMiddleware,
+    allowed_hosts=json.loads(settings.BACKEND_CORS_ORIGINS),
+    enable_xss_protection=True,
+    enable_content_security=True,
+    enable_frame_protection=True
+)
+app.add_middleware(XSSProtection)
+app.add_middleware(
+    RateLimitByIP,
+    limit=settings.RATE_LIMIT
+)
+app.add_middleware(RequestLoggingMiddleware)
+
+# Security headers middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["Content-Security-Policy"] = "default-src 'self'"
+    return response
 
 # Vosk modelini yükle
 if not os.path.exists("model"):
@@ -145,18 +203,97 @@ def calculate_file_hash(file_path: str) -> str:
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
 
+def validate_video_file(file: UploadFile):
+    # Dosya uzantısı kontrolü
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="Desteklenmeyen dosya formatı")
+    
+    # MIME type kontrolü
+    content = file.file.read(2048)
+    file.file.seek(0)
+    mime = magic.from_buffer(content, mime=True)
+    if not mime.startswith('video/'):
+        raise HTTPException(status_code=400, detail="Geçersiz dosya türü")
+    
+    # Boyut kontrolü
+    if file.size > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="Dosya boyutu çok büyük (max 100MB)")
+
+# JWT ayarları
+SECRET_KEY = secrets.token_urlsafe(32)
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Session cookie
+cookie_sec = APIKeyCookie(name="session")
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_session(session: str = Depends(cookie_sec)):
+    try:
+        payload = jwt.decode(session, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Geçersiz oturum")
+
+# CSRF token oluşturma
+def generate_csrf_token():
+    return secrets.token_urlsafe(32)
+
+@app.middleware("http")
+async def csrf_protection(request: Request, call_next):
+    if request.method in ["POST", "PUT", "DELETE", "PATCH"]:
+        csrf_token = request.headers.get("X-CSRF-Token")
+        session_csrf = request.cookies.get("csrf_token")
+        
+        if not csrf_token or not session_csrf or csrf_token != session_csrf:
+            raise HTTPException(status_code=403, detail="CSRF token geçersiz")
+    
+    response = await call_next(request)
+    return response
+
+@app.post("/login")
+async def login(response: Response):
+    # Örnek login - gerçek uygulamada kullanıcı doğrulama eklenecek
+    access_token = create_access_token(data={"sub": "user"})
+    csrf_token = generate_csrf_token()
+    
+    response.set_cookie(
+        key="session",
+        value=access_token,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=1800
+    )
+    response.set_cookie(
+        key="csrf_token",
+        value=csrf_token,
+        httponly=False,
+        secure=True,
+        samesite="strict",
+        max_age=1800
+    )
+    return {"csrf_token": csrf_token}
+
 @app.post("/upload-video/")
 @limiter.limit("10/hour")
 async def upload_video(
     request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    normalize_sound: bool = Query(False, description="Ses seviyesini normalize et"),
-    target_db: float = Query(-20.0, description="Hedef ses seviyesi (dB)")
+    data: VideoUploadRequest = Depends(),
+    current_user: User = Depends(get_current_active_user)
 ):
+    """Video yükle ve işlemeye başla"""
     try:
         app_logger.info(f"Video yükleme isteği alındı: {file.filename}")
-        client_ip = request.client.host
         
         # Geçici dosya oluştur
         with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_video:
@@ -166,39 +303,52 @@ async def upload_video(
 
         try:
             # Video doğrulama
-            is_valid, message = validate_video(temp_video_path)
-            if not is_valid:
-                raise ValidationError(message)
+            validation_result = await VideoValidator.validate_video(temp_video_path, file.filename)
+            if not validation_result.is_valid:
+                raise ValidationError(validation_result.message)
+
+            # Güvenli yükleme yolu oluştur
+            upload_path, safe_filename = await VideoValidator.create_safe_upload_path(
+                settings.UPLOAD_DIR,
+                file.filename
+            )
+
+            # Dosyayı güvenli konuma taşı
+            os.rename(temp_video_path, upload_path)
 
             # Ses normalizasyonu
-            if normalize_sound:
+            if data.normalize_sound:
                 app_logger.info("Ses normalizasyonu başlatılıyor...")
-                audio_stats = get_audio_stats(temp_video_path)
-                if audio_stats["has_audio"]:
-                    temp_video_path = normalize_audio(temp_video_path, target_db)
+                if validation_result.file_info.get('has_audio'):
+                    upload_path = normalize_audio(upload_path, data.target_db)
                     app_logger.info("Ses normalizasyonu tamamlandı")
                 else:
                     app_logger.warning("Videoda ses bulunamadı")
 
-            # Dosya hash'ini hesapla
-            file_hash = calculate_file_hash(temp_video_path)
+            # Dosya hash'ini al
+            file_hash = validation_result.file_info['hash']
             
             # Redis'ten önbelleklenmiş sonuçları kontrol et
             redis_client = await get_redis()
             cached_result = await redis_client.get(f"video:{file_hash}")
             
             if cached_result:
-                os.unlink(temp_video_path)
+                os.unlink(upload_path)
                 app_logger.info("Önbellekten sonuçlar alındı")
                 return JSONResponse(content={"subtitles": json.loads(cached_result)})
             
             # Celery görevi başlat
-            task = process_video.delay(temp_video_path)
+            task = process_video.delay(
+                upload_path,
+                user_id=current_user.username,
+                metadata=validation_result.file_info
+            )
             app_logger.info(f"Video işleme görevi başlatıldı: {task.id}")
             
             return JSONResponse(content={
                 "task_id": task.id,
-                "status": "processing"
+                "status": "processing",
+                "metadata": validation_result.file_info
             })
 
         except Exception as e:
@@ -214,7 +364,10 @@ async def upload_video(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/task/{task_id}")
-async def get_task_status(task_id: str):
+async def get_task_status(
+    task_id: str,
+    current_user: User = Depends(get_current_active_user)
+):
     """Görev durumunu kontrol et"""
     try:
         app_logger.info(f"Görev durumu kontrolü: {task_id}")
@@ -260,7 +413,8 @@ async def get_task_status(task_id: str):
 @app.post("/adjust-timing/{task_id}")
 async def adjust_subtitle_timing(
     task_id: str,
-    offset: float = Query(..., description="Zaman düzeltme değeri (saniye)")
+    offset: float = Query(..., description="Zaman düzeltme değeri (saniye)"),
+    current_user: User = Depends(get_current_active_user)
 ):
     """Alt yazı zamanlamasını ayarla"""
     try:
@@ -294,7 +448,8 @@ async def adjust_subtitle_timing(
 async def export_subtitles(
     task_id: str,
     format: str = Query(..., description="Alt yazı formatı (srt veya vtt)"),
-    color: str = Query("white", description="Alt yazı rengi")
+    color: str = Query("white", description="Alt yazı rengi"),
+    current_user: User = Depends(get_current_active_user)
 ):
     """Alt yazıları dışa aktar"""
     try:
@@ -352,6 +507,115 @@ async def shutdown_event():
     if redis is not None:
         await redis.close()
     app_logger.info("Uygulama kapatıldı")
+
+# Logger'ı başlat
+logger = setup_logging()
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"Request: {request.method} {request.url.path}")
+    response = await call_next(request)
+    logger.info(f"Response: {response.status_code}")
+    return response
+
+# Auth endpoint'leri
+@app.post("/token", response_model=Token)
+async def login_for_access_token(
+    response: Response,
+    form_data: OAuth2PasswordRequestForm = Depends()
+):
+    user = authenticate_user(fake_users_db, form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Kullanıcı adı veya şifre hatalı",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token_expires = timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.username}, expires_delta=access_token_expires
+    )
+    
+    csrf_token = generate_csrf_token()
+    
+    # Secure cookie'leri ayarla
+    response.set_cookie(
+        key="session",
+        value=access_token,
+        httponly=True,
+        secure=True,
+        samesite="strict",
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    )
+    response.set_cookie(
+        key="csrf_token",
+        value=csrf_token,
+        httponly=False,
+        secure=True,
+        samesite="strict",
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "csrf_token": csrf_token
+    }
+
+@app.post("/logout")
+async def logout(response: Response):
+    response.delete_cookie("session")
+    response.delete_cookie("csrf_token")
+    return {"message": "Çıkış yapıldı"}
+
+@app.get("/check-auth", response_model=User)
+async def check_auth(current_user: User = Depends(get_current_active_user)):
+    return current_user
+
+# Exception handler'ları ekle
+app.add_exception_handler(BaseAPIException, api_exception_handler)
+app.add_exception_handler(Exception, unhandled_exception_handler)
+
+@app.get("/health")
+async def health_check():
+    """Sistem sağlık kontrolü"""
+    try:
+        # Redis bağlantısını kontrol et
+        redis_client = await get_redis()
+        await redis_client.ping()
+        
+        # Celery worker'ı kontrol et
+        i = process_video.app.control.inspect()
+        workers = i.active()
+        
+        if not workers:
+            return JSONResponse(
+                status_code=503,
+                content={"status": "error", "message": "Celery worker aktif değil"}
+            )
+        
+        # Disk alanını kontrol et
+        disk = os.statvfs("/tmp")
+        free_space = disk.f_bavail * disk.f_frsize
+        
+        if free_space < 100 * 1024 * 1024:  # 100MB'dan az boş alan
+            return JSONResponse(
+                status_code=503,
+                content={"status": "error", "message": "Yetersiz disk alanı"}
+            )
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.utcnow().isoformat(),
+            "free_space_mb": free_space // (1024 * 1024)
+        }
+        
+    except Exception as e:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "error", "message": str(e)}
+        )
 
 if __name__ == "__main__":
     import uvicorn

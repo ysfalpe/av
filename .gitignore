@@ -20,16 +20,12 @@ var/
 .installed.cfg
 *.egg
 
-# Node
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+# Vosk model
+backend/model/
+
+# Virtual Environment
+venv/
 .env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
 
 # IDE
 .idea/
@@ -37,15 +33,29 @@ yarn-error.log*
 *.swp
 *.swo
 
-# OS
-.DS_Store
-Thumbs.db
+# Logs
+logs/
+*.log
 
-# Project specific
-backend/model/
-backend/logs/
-frontend/dist/
-*.mp4
-*.avi
-*.mov
-*.webm 
+# Temp files
+/tmp/
+*.tmp
+*.temp
+
+# Redis
+dump.rdb
+*.rdb
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build
+/dist/
+/build/
+
+# Glitch specific
+.glitch-assets
+.node-gyp 

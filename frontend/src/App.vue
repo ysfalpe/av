@@ -168,6 +168,7 @@
 
 <script>
 import { ref, computed, onMounted } from 'vue'
+import { config } from './config'
 
 export default {
   name: 'App',
@@ -253,7 +254,7 @@ export default {
       formData.append('target_db', targetDb.value)
 
       try {
-        const response = await fetch('http://localhost:8000/upload-video/', {
+        const response = await fetch(`${config.API_URL}/upload-video/`, {
           method: 'POST',
           body: formData
         })
@@ -279,7 +280,7 @@ export default {
       if (!currentTaskId.value) return
 
       try {
-        const response = await fetch(`http://localhost:8000/task/${currentTaskId.value}`)
+        const response = await fetch(`${config.API_URL}/task/${currentTaskId.value}`)
         const data = await response.json()
 
         if (data.state === 'SUCCESS') {
@@ -305,7 +306,7 @@ export default {
       if (!currentTaskId.value) return
 
       try {
-        const response = await fetch(`http://localhost:8000/adjust-timing/${currentTaskId.value}?offset=${timeOffset.value}`, {
+        const response = await fetch(`${config.API_URL}/adjust-timing/${currentTaskId.value}?offset=${timeOffset.value}`, {
           method: 'POST'
         })
 
@@ -327,7 +328,7 @@ export default {
 
       try {
         const response = await fetch(
-          `http://localhost:8000/export-subtitles/${currentTaskId.value}?format=${exportFormat.value}&color=${subtitleColor.value}`
+          `${config.API_URL}/export-subtitles/${currentTaskId.value}?format=${exportFormat.value}&color=${subtitleColor.value}`
         )
 
         if (!response.ok) {

@@ -70,3 +70,30 @@ def merge_nearby_subtitles(subtitles: list, threshold: float = 0.3) -> list:
     
     merged.append(current)
     return merged 
+
+def create_subtitled_video(video_path, subtitles, output_path):
+    """Video üzerine altyazıları ekler ve yeni bir video dosyası oluşturur."""
+    from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip
+    import os
+
+    video = VideoFileClip(video_path)
+    clips = [video]
+
+    for sub in subtitles:
+        start_time = sub["start"] / 1000  # milisaniyeden saniyeye çevir
+        end_time = sub["end"] / 1000
+        text = sub["text"]
+
+        txt_clip = (TextClip(text, font='Arial', fontsize=24, color='white', stroke_color='black', stroke_width=1)
+                   .set_position(('center', 'bottom'))
+                   .set_duration(end_time - start_time)
+                   .set_start(start_time))
+        
+        clips.append(txt_clip)
+
+    final_video = CompositeVideoClip(clips)
+    final_video.write_videofile(output_path, codec='libx264', audio_codec='aac')
+    final_video.close()
+    video.close()
+
+    return output_path 
